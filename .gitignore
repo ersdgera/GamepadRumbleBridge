@@ -1,0 +1,16 @@
+# Build outputs
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# NuGet packages
+packages/
+
+# Rider/IDEA
+.idea/
+*.sln.iml
+
+# Logs
+*.log
