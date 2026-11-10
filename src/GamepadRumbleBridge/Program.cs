@@ -159,9 +159,13 @@ public partial class MainForm : Form
 
     void OnXboxFeedbackReceived(object sender, Xbox360EventArgs e)
     {
+        // ViGEm передаёт значения как float (0.0–1.0).
+        // Геймпад поддерживает только ON/OFF — любой ненулевой сигнал переводим в максимум.
+        byte small = e.SmallMotor > 0 ? (byte)255 : (byte)0;
+        byte big   = e.LargeMotor  > 0 ? (byte)255 : (byte)0;
         int idx = GetSlotByController(sender as IXbox360Controller);
         if (idx >= 0)
-            SendHidRumbleToPad(idx, e.SmallMotor, e.LargeMotor);
+            SendHidRumbleToPad(idx, small, big);
     }
 
     int GetSlotByController(IXbox360Controller? ctrl)
