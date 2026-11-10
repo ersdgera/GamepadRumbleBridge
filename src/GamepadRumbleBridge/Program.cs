@@ -16,25 +16,25 @@ namespace GamepadRumbleBridge;
 /// <summary>
 /// Фоновый мост вибрации для нескольких Generic USB Gamepad (VID_0079 &amp; PID_0006).
 ///
-/// ВАЖНОЕ ИЗМЕНЕНИЕ: каждый физический геймпад получает индивидуальный
-/// виртуальный Xbox 360 контроллер через ViGEmBus. В Steam Input каждый
-/// контроллер виден отдельно и имеет свои настройки вибрации.
+/// ВАЖНО: ViGEm регистрирует ВСЕ свои Xbox 360 контроллеры под одним XInput
+/// UserIndex (слот 0). Поэтому создаётся ОДИН стандартный виртуальный
+/// контроллер (VID_045E PID_028E) — игры видят его как обычный Xbox 360.
+/// Когда игра шлёт XInputSetState(0), событие FeedbackReceived приходит в мост,
+/// и ВСЕ подключённые физические геймпады вибрируют одновременно.
 ///
 /// Механизм:
-///   1. При старте создаём 4 пустых слота ViGEm (Xbox 360 controller)
-///   2. HidMonitor сканирует USB, находит HID-геймпады
-///   3. Найденный геймпад привязывается к первому свободному слоту
-///      (первый подключённый -> слот 0, второй -> слот 1, ...)
-///   4. Когда игра шлёт XInput-вибрацию на конкретный виртуальный контроллер,
-///      событие попадает ТОЛЬКО в этот слот -> HID отправляется только туда
-///   5. Named Pipe позволяет тестировать вручную с индексом: "0 255 255"
+///   1. При старте создаём ОДИН виртуальный Xbox 360 контроллер (ViGEm)
+///   2. HidMonitor сканирует USB, находит HID-геймпады, открывает их
+///   3. XInput-вибрация от игры -> FeedbackReceived -> все HID-геймпады (ON/OFF)
+///   4. Named Pipe позволяет тестировать вручную с индексом: "0 255 255"
 /// </summary>
 public partial class MainForm : Form
 {
-    const ushort TargetVid = 0x0079;
-    const ushort TargetPid = 0x0006;
-    // Сдвиг PID для каждого виртуального слота — чтобы Windows видела их как разные устройства
-    const ushort PidSlotShift = 0x0100;
+    const ushort TargetVid   = 0x0079;
+    const ushort TargetPid   = 0x0006;
+    // Стандартный Xbox 360 VID/PID — игры узнают контроллер именно по этому ID
+    const ushort VirtVid      = 0x045E;
+    const ushort VirtPid      = 0x028E;
     const string PipeName  = "GamepadRumblePipe";
     const int    MaxPads   = 4;
 
@@ -46,7 +46,12 @@ public partial class MainForm : Form
     volatile bool _rumbleOn = true;
     CancellationTokenSource? _cts;
 
-    // Один слот = одна пара {ViGEm-контроллер, HID-ручка}
+    // Один общий ViGEm-контроллер для всей системы (ViGEm делят все контроллеры
+    // один XInput-слот, поэтому это единственный рабочий вариант для игр)
+    IXbox360Controller?  _vigemController;
+    ViGEmClient?         _vigemClient;
+
+    // Слоты HID-геймпадов — вибрируют все одновременно
     readonly List<GamepadEntry> _pads = new();
 
     NotifyIcon?         _tray;
@@ -55,18 +60,15 @@ public partial class MainForm : Form
 
     struct GamepadEntry
     {
-        public IXbox360Controller? Controller;
-        public IntPtr              HidHandle;
-        public string              DevicePath;
-        public bool                Connected;
-        public ViGEmClient?        ViGemClient;
+        public IntPtr HidHandle;
+        public string DevicePath;
+        public bool   Connected;
     }
 
     // ==================== MAIN / LOAD ====================
     public MainForm()
     {
         InitializeTray();
-        // Предзаполняем слоты пустыми записями — ViGEm создаётся лениво при подключении
         for (int i = 0; i < MaxPads; i++)
             _pads.Add(new GamepadEntry());
         SetStatus("Ждём геймпады...", false, 0);
@@ -84,6 +86,20 @@ public partial class MainForm : Form
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
 
+        // Создаём ОДИН общий виртуальный Xbox 360 контроллер — он принимает все XInput-вибрации
+        try
+        {
+            _vigemClient   = new ViGEmClient();
+            _vigemController = _vigemClient.CreateXbox360Controller(VirtVid, VirtPid);
+            _vigemController.FeedbackReceived += OnXboxFeedbackReceived;
+            _vigemController.Connect();
+        }
+        catch (Exception ex)
+        {
+            ShowBalloon("Ошибка", $"Не удалось создать ViGEm: {ex.Message}");
+            return;
+        }
+
         Task.Run(() => HidMonitor(token),     token);
         Task.Run(() => PipeServer(token),     token);
     }
@@ -95,10 +111,11 @@ public partial class MainForm : Form
     }
 
     // ==================== ViGEm SETUP ====================
-    // Убрано — контроллеры создаются лениво при подключении HID-геймпада.
+    // ОДИН общий виртуальный контроллер создаётся в OnLoad.
+    // HID-геймпады создаются лениво при подключении — привязка к общему ViGEm слоту.
 
     // ==================== HID MONITOR ====================
-    // Каждые 3 сек проверяет: появились ли новые HID-геймпады -> привязывает к слоту
+    // Каждые 3 сек проверяет: появились ли новые HID-геймпады -> открывает их
     // Отключение определяется ЛОГИЧЕСКИ: если путь геймпада исчез из FindAllGamepadPaths(),
     // считаем что геймпад отключён. Никаких probing-записей в HID — никаких ложных срабатываний.
     async void HidMonitor(CancellationToken token)
@@ -121,13 +138,6 @@ public partial class MainForm : Form
                         var entry = _pads[i];
                         if (entry.HidHandle != IntPtr.Zero && entry.HidHandle != (IntPtr)(-1))
                             CloseHandle(entry.HidHandle);
-                        if (entry.Controller != null)
-                        {
-                            try { entry.Controller.Disconnect(); } catch { }
-                            entry.Controller.FeedbackReceived -= OnXboxFeedbackReceived;
-                        }
-                        // Освобождаем клиент ViGEm
-                        entry.ViGemClient?.Dispose();
                         _pads[i] = new GamepadEntry();
                         SetStatus(
                             $"Геймпад #{i + 1} отключён ({CountConnected()}/{MaxPads})",
@@ -151,20 +161,11 @@ public partial class MainForm : Form
                             IntPtr h = OpenDevice(path);
                             if (h != IntPtr.Zero && h != (IntPtr)(-1))
                             {
-                                // Ленивое создание ViGEm-контроллера — только при подключении HID
-                                ushort slotPid = (ushort)(TargetPid + slot * PidSlotShift);
-                                var client    = new ViGEmClient();
-                                var ctrl      = client.CreateXbox360Controller(TargetVid, slotPid);
-                                ctrl.FeedbackReceived += OnXboxFeedbackReceived;
-                                ctrl.Connect();
-
                                 var entry = new GamepadEntry
                                 {
-                                    HidHandle    = h,
-                                    DevicePath   = path,
-                                    Connected    = true,
-                                    Controller   = ctrl,
-                                    ViGemClient  = client,
+                                    HidHandle   = h,
+                                    DevicePath  = path,
+                                    Connected   = true,
                                 };
                                 _pads[slot] = entry;
                                 SetStatus(
@@ -183,26 +184,11 @@ public partial class MainForm : Form
     }
 
     // ==================== RUMBLE HANDLING ====================
-    // Каждое событие ViGEm содержит индекс контроллера через sender.
-    // Мы определяем какой слот -> шлём в его HID.
+    // ViGEm шлёт ОДНО событие FeedbackReceived — отправляем вибрацию ВСЕМ HID-геймпадам.
     void OnXboxFeedbackReceived(object sender, Xbox360EventArgs e)
     {
-        int idx = GetSlotByController(sender as IXbox360Controller);
-        if (idx >= 0)
-            SendHidRumbleToPad(idx, e.SmallMotor, e.LargeMotor);
-    }
-
-    int GetSlotByController(IXbox360Controller? ctrl)
-    {
-        if (ctrl == null) return -1;
-        lock (_pads)
-        {
-            for (int i = 0; i < _pads.Count; i++)
-            {
-                if (_pads[i].Controller == ctrl) return i;
-            }
-        }
-        return -1;
+        if (!_rumbleOn) return;
+        SendHidRumbleAll(e.SmallMotor, e.LargeMotor);
     }
 
     void SendHidRumbleToPad(int padIdx, byte small, byte big)
@@ -473,18 +459,13 @@ public partial class MainForm : Form
         {
             foreach (var pad in _pads)
             {
-                if (pad.Controller != null)
-                {
-                    try { pad.Controller.Disconnect(); } catch { }
-                }
-                pad.ViGemClient?.Dispose();
                 if (pad.HidHandle != IntPtr.Zero && pad.HidHandle != (IntPtr)(-1))
                     CloseHandle(pad.HidHandle);
             }
             _pads.Clear();
         }
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
+        try { _vigemController?.Disconnect(); } catch { }
+        _vigemClient?.Dispose();
         _tray?.Dispose();
         _menu?.Dispose();
     }
